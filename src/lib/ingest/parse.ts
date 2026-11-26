@@ -91,7 +91,7 @@ function detectDirection(text: string): Direction | null {
 
 function detectMode(text: string, isCardBill: boolean): PaymentMode {
   if (isCardBill) return "auto_debit";
-  if (/\b(upi|vpa)\b|@[a-z]{2,}\b/i.test(text)) return "upi";
+  if (/\b(upi|vpa)\b/i.test(text) || VPA.test(text)) return "upi";
   if (/\bcredit\s*card\b|\bcc\b/i.test(text)) return "credit_card";
   if (/\bdebit\s*card\b|\batm\b/i.test(text)) return "debit_card";
   if (/\b(neft|imps|rtgs)\b/i.test(text)) return "imps_neft";
@@ -103,9 +103,18 @@ function detectMode(text: string, isCardBill: boolean): PaymentMode {
   return "other";
 }
 
+/**
+ * A UPI handle, not an email address: `ramesh@ybl` is a handle, while
+ * `unauthorisedtransaction@sbi.co.in` is a mailbox the alert merely mentions.
+ */
+const VPA =
+  /\b[a-z0-9][a-z0-9._-]{2,30}@(?:ok(?:hdfcbank|icici|axis|sbi)?|ybl|paytm|axl|ibl|apl|upi|sbi|hdfcbank|icicibank|axisbank|yesbank|kotak|indusind|airtel)(?![a-z0-9.])/i;
+
 const AMOUNT_PATTERNS: RegExp[] = [
-  /(?:₹|rs\.?|inr)\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)/i,
-  /\b(?:debited|credited|spent|paid|received|withdrawn)(?:\s+(?:by|for|with))?\s+(?:rs\.?\s*|inr\s*)?([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)/i,
+  /(?:₹|rs\.?|inr)\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)(?![0-9])/i,
+  /\b(?:debited|credited|spent|paid|received|withdrawn)(?:\s+(?:by|for|with))?\s+(?:rs\.?\s*|inr\s*)?([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)(?![0-9])/i,
+  // Label-first templates, e.g. SBI's flattened table: "Amount (INR) 7550.00".
+  /\bamount\s*(?:\(\s*(?:inr|₹)\s*\)|(?:inr|₹))?\s*[:#]?\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)(?![0-9])/i,
 ];
 
 function detectAmountPaise(text: string): number | null {
@@ -125,7 +134,7 @@ function detectAmountPaise(text: string): number | null {
 
 const LAST4_PATTERNS: RegExp[] = [
   /\b(?:ending(?:\s+(?:with|in))?|ending\.?)\s*[:#]?\s*(?:xx|xx\*+|\*+)?\s*(\d{4})\b/i,
-  /\b(?:a\/c|account|card|ac)\s*(?:no\.?|number)?\s*[:#]?\s*(?:xx|\*+)?(\d{4})\b/i,
+  /\b(?:a\/c|account|card|ac)\s*(?:no\.?|number)?\s*[:#]?\s*(?:xx|x{1,4}|\*+)?(\d{4})\b/i,
   /\b(?:xx|\*{2,})(\d{4})\b/i,
 ];
 
@@ -140,8 +149,10 @@ function detectLast4(text: string): string | null {
 const MERCHANT_PATTERNS: RegExp[] = [
   // UPI/IMPS/P2M/<ref>/MERCHANT style tokens used by several bank templates.
   /\b(?:upi|imps|neft|p2m|p2a)\/[^/\s]*\/[^/\s]*\/([A-Za-z0-9 .&_-]{3,40})/i,
+  // Labelled fields from tabular templates, e.g. SBI's "Terminal Owner Name".
+  /\b(?:terminal owner name|merchant name|payee name|payee|terminal)\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9&.'_\- ]{2,48}?)(?=\s+(?:terminal|date|transaction|amount|last|channel|city|location|if not|you may)\b|[.,;\n]|$)/i,
   // A VPA handle is the most reliable merchant identity when present.
-  /\b([a-z0-9][a-z0-9._-]{2,30})@(?:ok(?:hdfcbank|icici|axis|sbi)?|ybl|paytm|axl|ibl|apl|upi|sbi|hdfcbank|icicibank|axisbank|yesbank|kotak|indusind|airtel)\b/i,
+  VPA,
   /\b(?:at|towards|paid to|sent to|to merchant|merchant)\s+([A-Za-z0-9][A-Za-z0-9&.'_\- ]{1,48}?)(?=\s+(?:on|via|using|from|ref|for|dt\.?|dated|successful|success|has been)\b|[.,;\n]|$)/i,
   /\bto\s+([A-Za-z0-9][A-Za-z0-9&.'_\- ]{1,40}?)(?=\s+(?:on|via|using|ref|from|for)\b|[.,;\n]|$)/i,
   /\bfrom\s+([A-Za-z0-9][A-Za-z0-9&.'_\- ]{1,40}?)(?=\s+(?:on|via|using|ref|for)\b|[.,;\n]|$)/i,
@@ -229,6 +240,19 @@ export function detectOccurredAt(text: string, fallback: Date): Date | null {
   );
   if (named) {
     const [, day, monthName, year, hour, minute] = named;
+    const month = (MONTHS.indexOf((monthName ?? "").toLowerCase()) + 1).toString().padStart(2, "0");
+    const fullYear = Number(year) < 100 ? 2000 + Number(year) : Number(year);
+    const iso = `${fullYear}-${month}-${String(Number(day)).padStart(2, "0")}T${String(Number(hour ?? "0")).padStart(2, "0")}:${String(Number(minute ?? "0")).padStart(2, "0")}`;
+    const parsed = istWallClock(iso);
+    if (parsed && plausible(parsed, fallback)) return parsed;
+  }
+
+  // Month-first templates, e.g. SBI's "Date & Time Nov 23, 2026, 13:06".
+  const monthFirst = text.match(
+    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2}),?\s+(\d{2,4})(?:[ T,]+(\d{1,2}):(\d{2}))?/i,
+  );
+  if (monthFirst) {
+    const [, monthName, day, year, hour, minute] = monthFirst;
     const month = (MONTHS.indexOf((monthName ?? "").toLowerCase()) + 1).toString().padStart(2, "0");
     const fullYear = Number(year) < 100 ? 2000 + Number(year) : Number(year);
     const iso = `${fullYear}-${month}-${String(Number(day)).padStart(2, "0")}T${String(Number(hour ?? "0")).padStart(2, "0")}:${String(Number(minute ?? "0")).padStart(2, "0")}`;
