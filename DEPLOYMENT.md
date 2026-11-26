@@ -42,6 +42,14 @@ including port:
 - `http://localhost:3100/api/ingest/gmail/callback` (local dev)
 - `https://<your-project>.vercel.app/api/ingest/gmail/callback` (production)
 
+The session cookie is scoped to one origin, so sign in on exactly the origin
+Google returns to. In local development, open the app at
+`http://localhost:3100` (not `127.0.0.1`, and not a proxy that rewrites the
+`Host` header): the redirect URI above is built from the request host, so
+visiting `127.0.0.1` sends Google a `localhost` return address and the callback
+arrives without a session cookie. If you do need `127.0.0.1`, register that
+URI too and use the same host throughout.
+
 Also confirm on the OAuth consent screen that the scopes `gmail.readonly`,
 `openid` and `email` are present, and that `borkarswapnanshu@gmail.com` is
 listed as a test user.
