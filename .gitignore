@@ -1,0 +1,21 @@
+node_modules/
+.next/
+out/
+build/
+.env
+.env.local
+.env*.local
+*.log
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+.firebase/
+emulator-data/
+.vercel/
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+
+# local scratch: probe scripts and one-off helpers
+.probe-*.ts
+.tmp-*

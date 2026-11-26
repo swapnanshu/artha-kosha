@@ -1,0 +1,44 @@
+{
+  "name": "artha-kosha",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "emulator": "bunx firebase-tools emulators:start --project artha-kosha-dev",
+    "seed": "bun scripts/seed-emulator.ts",
+    "seed:remote": "bun scripts/seed-emulator.ts --remote",
+    "owner-claim": "bun scripts/set-owner-claim.ts"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "^1.2.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "firebase": "^11.10.0",
+    "firebase-admin": "^13.4.0",
+    "lucide-react": "^0.468.0",
+    "next": "15.5.7",
+    "react": "19.1.1",
+    "react-dom": "19.1.1",
+    "server-only": "^0.0.1",
+    "tailwind-merge": "^2.6.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3.2.0",
+    "@tailwindcss/postcss": "^4.1.14",
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "eslint": "^9.17.0",
+    "eslint-config-next": "15.5.7",
+    "prettier": "^3.4.2",
+    "tailwindcss": "^4.1.14",
+    "typescript": "^5.7.2"
+  }
+}
