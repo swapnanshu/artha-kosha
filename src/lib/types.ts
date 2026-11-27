@@ -121,7 +121,7 @@ export interface RawAlert {
   reviewedAt: Timestamp | null;
 }
 
-export type AccountKind = "bank" | "wallet" | "credit_card" | "cash";
+export type AccountKind = "bank" | "wallet" | "credit_card" | "debit_card" | "cash";
 
 export interface Account {
   name: string;

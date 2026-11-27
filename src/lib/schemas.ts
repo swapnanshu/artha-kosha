@@ -14,7 +14,7 @@ export const paymentModeSchema = z.enum([
   "other",
 ]);
 
-export const accountKindSchema = z.enum(["bank", "wallet", "credit_card", "cash"]);
+export const accountKindSchema = z.enum(["bank", "wallet", "credit_card", "debit_card", "cash"]);
 
 /** Quick-add input. Amounts arrive in rupees from the form, paise after parse. */
 export const txnInputSchema = z.object({

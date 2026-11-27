@@ -31,6 +31,7 @@ export function categoryKindLabel(kind: string): string {
 export const ACCOUNT_KINDS: Array<{ value: AccountKind; label: string }> = [
   { value: "bank", label: "Bank account" },
   { value: "credit_card", label: "Credit card" },
+  { value: "debit_card", label: "Debit card" },
   { value: "wallet", label: "Wallet" },
   { value: "cash", label: "Cash" },
 ];

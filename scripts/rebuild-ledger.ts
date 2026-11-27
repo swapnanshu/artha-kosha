@@ -16,6 +16,9 @@
  *   bun --conditions react-server scripts/rebuild-ledger.ts --repair  # drop the
  *       rows the current parser calls noise, and the alerts it can now read, so
  *       the next --rescan ingests them again from Gmail
+ *   bun --conditions react-server scripts/rebuild-ledger.ts --relink  # match the
+ *       stored rows to the accounts that exist now. No re-reading is needed:
+ *       every row kept its own last-4 and payment mode
  *
  * Parsing happens at ingest time only, so old rawAlerts keep whatever the old
  * parser decided. A clean slate is the only way to apply parser fixes to
@@ -23,12 +26,13 @@
  */
 import { readFileSync } from "node:fs";
 import type { Query } from "firebase-admin/firestore";
-import type { RawAlert, Source } from "@/lib/types";
+import type { RawAlert, Source, Txn } from "@/lib/types";
 
 const resume = process.argv.includes("--resume");
 const rescan = process.argv.includes("--rescan");
 const repair = process.argv.includes("--repair");
-const apply = resume || rescan || repair || process.argv.includes("--yes");
+const relink = process.argv.includes("--relink");
+const apply = resume || rescan || repair || relink || process.argv.includes("--yes");
 
 const env = readFileSync(".env.local", "utf8");
 for (const line of env.split(/\r?\n/)) {
@@ -180,9 +184,8 @@ async function repairLedger(): Promise<void> {
   console.log("  run --rescan next so Gmail recreates those alerts with the current parser");
 }
 
-async function report(totals: Totals): Promise<void> {
-  // Counters are incremented during ingest; rebuilding each month from the
-  // ledger proves they agree before the owner looks at the dashboard.
+/** Counters must agree with the ledger after anything rewrites rows. */
+async function recomputeMonths(): Promise<string[]> {
   console.log("recomputing month stats from the ledger");
   const monthSnapshot = await collections.txn().get();
   const months = new Set<string>();
@@ -190,7 +193,8 @@ async function report(totals: Totals): Promise<void> {
     const row = doc.data();
     if (!row.deletedAt) months.add(row.yearMonth);
   }
-  for (const yearMonth of [...months].sort()) {
+  const sorted = [...months].sort();
+  for (const yearMonth of sorted) {
     const stats = await recomputeMonth(yearMonth);
     console.log(
       `  ${yearMonth}  ${String(stats.txnCount).padStart(4)} txns  ` +
@@ -198,6 +202,169 @@ async function report(totals: Totals): Promise<void> {
     );
   }
   console.log("");
+  return sorted;
+}
+
+/**
+ * The account behind a row is decided once, when its alert is ingested, so
+ * every row written before a card existed kept `accountId: null` and no amount
+ * of re-syncing would fill it. This re-runs the same resolver over the stored
+ * rows using their own last-4 and payment mode, then repairs the two things
+ * that depend on the link: transfer/card-bill pairing and the month counters.
+ */
+async function relinkAccounts(): Promise<void> {
+  const { loadIngestContext, resolveAccount, tryPairTransfer } = await import("@/lib/ingest/ingest");
+
+  const ctx = await loadIngestContext();
+  console.log(`active accounts  ${ctx.accounts.length}`);
+  for (const account of ctx.accounts) {
+    console.log(
+      `  ${account.name.padEnd(26)} ${account.kind.padEnd(12)} ` +
+        `inst=${account.institution ?? "—"} last4=${account.last4 ?? "—"}`,
+    );
+  }
+  console.log("");
+  if (ctx.accounts.length === 0) {
+    console.log("No active account, so there is nothing to link to. Add them first.");
+    return;
+  }
+
+  const alertSnapshot = await db.collection("rawAlerts").get();
+  const senders = new Map<string, string | null>();
+  for (const doc of alertSnapshot.docs) senders.set(doc.id, (doc.data() as RawAlert).from ?? null);
+
+  const txnSnapshot = await db.collection("txn").get();
+  const perAccount = new Map<string, number>();
+  const unresolved = new Map<string, number>();
+  let linked = 0;
+  let alreadyLinked = 0;
+  let batch = db.batch();
+  let queued = 0;
+
+  for (const doc of txnSnapshot.docs) {
+    const txn = doc.data() as Txn;
+    if (txn.deletedAt) continue;
+    if (txn.accountId && ctx.accounts.some((account) => account.id === txn.accountId)) {
+      alreadyLinked += 1;
+      continue;
+    }
+
+    // A merged row may have been created by SMS, whose sender is a phone number,
+    // so any one of its alerts that names an institution is enough.
+    let match: (typeof ctx.accounts)[number] | null = null;
+    for (const alertId of txn.alertIds ?? []) {
+      match = resolveAccount(
+        { last4: txn.last4, paymentMode: txn.paymentMode },
+        senders.get(alertId) ?? null,
+        ctx,
+      );
+      if (match) break;
+    }
+
+    if (!match) {
+      const key = txn.last4 ? `••${txn.last4}` : `${txn.paymentMode}, no last-4`;
+      unresolved.set(key, (unresolved.get(key) ?? 0) + 1);
+      continue;
+    }
+
+    batch.update(doc.ref, { accountId: match.id, updatedAt: Timestamp.now() });
+    queued += 1;
+    linked += 1;
+    perAccount.set(match.id, (perAccount.get(match.id) ?? 0) + 1);
+    if (queued === 400) {
+      await batch.commit();
+      batch = db.batch();
+      queued = 0;
+    }
+  }
+  if (queued > 0) await batch.commit();
+
+  console.log(`linked ${linked} rows (${alreadyLinked} were linked already)`);
+  for (const account of ctx.accounts) {
+    const count = perAccount.get(account.id);
+    if (count) console.log(`  ${String(count).padStart(4)} → ${account.name}`);
+  }
+  console.log("");
+
+  // A pair needs both legs linked, so this runs after the writes have landed.
+  console.log("pairing transfers and card bills");
+  const fresh = await db.collection("txn").get();
+
+  // A card cannot settle another card, so a group whose two legs are both
+  // credit cards is a false pairing from the older rule and is undone first.
+  const rowsById = new Map<string, Txn>();
+  const groupLegs = new Map<string, string[]>();
+  for (const doc of fresh.docs) {
+    const txn = doc.data() as Txn;
+    rowsById.set(doc.id, txn);
+    if (!txn.deletedAt && txn.transferGroupId) {
+      groupLegs.set(txn.transferGroupId, [...(groupLegs.get(txn.transferGroupId) ?? []), doc.id]);
+    }
+  }
+  for (const [groupId, legs] of groupLegs) {
+    const kinds = legs.map((id) => {
+      const row = rowsById.get(id);
+      return ctx.accounts.find((account) => account.id === row?.accountId)?.kind;
+    });
+    if (kinds.length < 2 || !kinds.every((kind) => kind === "credit_card")) continue;
+
+    const undo = db.batch();
+    for (const id of legs) {
+      undo.update(collections.txn().doc(id), {
+        categoryId: null,
+        categorySource: "default",
+        isInternalTransfer: false,
+        transferGroupId: null,
+        updatedAt: Timestamp.now(),
+      });
+    }
+    undo.set(collections.audit().doc(), {
+      actor: "relink",
+      action: "txn.unpair",
+      txnId: legs[0] ?? null,
+      before: { groupId },
+      after: null,
+      at: Timestamp.now(),
+    });
+    await undo.commit();
+    console.log(`  unpaired ${groupId}: both legs are credit cards`);
+  }
+
+  const groups = new Set<string>();
+  for (const doc of fresh.docs) {
+    const txn = doc.data() as Txn;
+    if (txn.deletedAt || txn.transferGroupId || !txn.accountId) continue;
+    try {
+      const group = await tryPairTransfer(doc.id, ctx, "relink");
+      if (group) {
+        groups.add(group);
+        console.log(
+          `  ${txn.yearMonth}  ₹${(txn.amountPaise / 100).toFixed(2)} ${txn.direction}  ${group}`,
+        );
+      }
+    } catch (error) {
+      console.error(`  ${doc.id}: pairing deferred`, error);
+    }
+  }
+  console.log(`  ${groups.size} new pairs`);
+  console.log("");
+
+  if (unresolved.size > 0) {
+    const total = [...unresolved.values()].reduce((sum, count) => sum + count, 0);
+    console.log(`${total} rows still have no account:`);
+    for (const [key, count] of [...unresolved].sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${String(count).padStart(4)}  ${key}`);
+    }
+    console.log("");
+  }
+
+  await recomputeMonths();
+}
+
+async function report(totals: Totals): Promise<void> {
+  // Counters are incremented during ingest; rebuilding each month from the
+  // ledger proves they agree before the owner looks at the dashboard.
+  const months = await recomputeMonths();
 
   const statuses = await Promise.all(
     PARSE_STATUSES.map(
@@ -226,9 +393,11 @@ async function main() {
           ? "RESCAN (no wipe, re-walks the 12 months for messages not seen yet)"
           : repair
             ? "REPAIR (dropping rows the parser rejects)"
-            : apply
-            ? "REBUILD (deleting)"
-            : "dry run (nothing deleted)"
+            : relink
+              ? "RELINK (matching stored rows to the accounts that exist now)"
+              : apply
+                ? "REBUILD (deleting)"
+                : "dry run (nothing deleted)"
     }`,
   );
   console.log("");
@@ -273,6 +442,11 @@ async function main() {
 
   if (!apply) {
     console.log("Dry run only. Re-run with --yes to wipe the derived data and backfill 12 months.");
+    return;
+  }
+
+  if (relink) {
+    await relinkAccounts();
     return;
   }
 

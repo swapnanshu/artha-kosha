@@ -5,7 +5,7 @@ import { collections } from "@/lib/firestore/collections";
 import { applyStats, categoryKindLookup, contributionOf, type CategoryKindLookup } from "@/lib/firestore/stats";
 import { yearMonthInIst } from "@/lib/dates";
 import { merchantRuleKey, merchantTokens, normalizeMerchant } from "@/lib/merchant";
-import { alertDocId, type Account, type Category, type Direction, type MerchantRule, type RawAlert, type Source, type Txn } from "@/lib/types";
+import { alertDocId, type Account, type AccountKind, type Category, type Direction, type MerchantRule, type PaymentMode, type RawAlert, type Source, type Txn } from "@/lib/types";
 import { parseAlert, senderTemplate, type ParsedAlert } from "@/lib/ingest/parse";
 
 export const CARD_BILL_CATEGORY = "card-bill";
@@ -58,35 +58,56 @@ export async function loadIngestContext(): Promise<IngestContext> {
   };
 }
 
+/** The parts of an alert that choose an account; stored rows carry both too. */
+export interface AccountHint {
+  last4: string | null;
+  paymentMode: PaymentMode;
+}
+
+/**
+ * A card spend and a card settlement both name a card, and a debit card shares
+ * its number with the account behind it, so the mode decides which record it is.
+ */
+function kindFitsMode(kind: AccountKind, mode: PaymentMode): boolean {
+  if (mode === "credit_card") return kind === "credit_card";
+  if (mode === "debit_card") return kind === "debit_card";
+  return kind !== "credit_card" && kind !== "debit_card";
+}
+
 /**
  * The card/bank that moved the money. A last-4 match wins; otherwise the
  * sender's institution plus the payment mode picks the account of that kind.
  */
-export function resolveAccount(parsed: ParsedAlert, from: string | null, ctx: IngestContext) {
+export function resolveAccount(parsed: AccountHint, from: string | null, ctx: IngestContext) {
   const institution = senderTemplate(from).institution;
 
   if (parsed.last4) {
     const matches = ctx.accounts.filter((account) => account.last4 === parsed.last4);
     if (matches.length === 1) return matches[0] ?? null;
     if (matches.length > 1) {
-      const byKind = matches.find((account) =>
-        parsed.paymentMode === "credit_card"
-          ? account.kind === "credit_card"
-          : account.kind !== "credit_card",
-      );
+      const byKind = matches.find((account) => kindFitsMode(account.kind, parsed.paymentMode));
       return byKind ?? matches[0] ?? null;
     }
   }
 
   if (institution) {
-    const byInstitution = ctx.accounts.filter(
-      (account) =>
-        account.institution?.toLowerCase().includes(institution.toLowerCase()) &&
-        (parsed.paymentMode === "credit_card"
-          ? account.kind === "credit_card"
-          : account.kind !== "credit_card"),
+    const sameInstitution = ctx.accounts.filter((account) =>
+      account.institution?.toLowerCase().includes(institution.toLowerCase()),
+    );
+    const byInstitution = sameInstitution.filter((account) =>
+      kindFitsMode(account.kind, parsed.paymentMode),
     );
     if (byInstitution.length === 1) return byInstitution[0] ?? null;
+    if (byInstitution.length > 1) {
+      // Two accounts at one bank and no last-4: only an exact kind match is
+      // safe, because guessing would misattribute someone's spending.
+      const exact = byInstitution.filter((account) => account.kind === parsed.paymentMode);
+      return exact.length === 1 ? (exact[0] ?? null) : null;
+    }
+    // Nothing fits the mode, but the sender names one institution and only one
+    // account lives there: an RBL "payment received" prints neither a card nor
+    // an account, and that card is the only thing the alert can refer to.
+    if (sameInstitution.length === 1) return sameInstitution[0] ?? null;
   }
 
   return null;
@@ -465,6 +486,12 @@ export async function tryPairTransfer(
       // A pair is only safe when a card is involved or the alert itself said
       // "bill payment"/"self transfer". Two unrelated ₹500 rows must not merge.
       const cardInvolved = account?.kind === "credit_card" || other.kind === "credit_card";
+      // Two cards cannot settle each other: a bill is a bank debit against a
+      // card credit. Without this, any two equal amounts where one side was a
+      // card became a "bill payment", which is how two unrelated ₹2 token
+      // charges got paired.
+      const bothCards = account?.kind === "credit_card" && other.kind === "credit_card";
+      if (bothCards) return false;
       const signal = txn.isInternalTransfer || row.isInternalTransfer;
       return cardInvolved || signal;
     });
