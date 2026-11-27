@@ -27,11 +27,17 @@ const SENDER_FILTER = [
   "hdfcbank.net",
   "icicibank.com",
   "axisbank.com",
+  // RBL and SBI also alert from their newer `*.bank.in` domains, not just the
+  // legacy `rblbank.com` / `sbi.co.in`: a refund or NEFT credited there is a
+  // real ledger row, and the old list dropped it silently.
   "rblbank.com",
+  "rbl.bank.in",
   "indusind.com",
   "kotak.com",
+  "kotak.bank.in",
   "aubank.in",
   "sbi.co.in",
+  "sbi.bank.in",
   "onlinesbi.com",
   "sbicard.com",
   "niyo.com",
@@ -47,9 +53,14 @@ const SENDER_FILTER = [
   "paytmbank.com",
 ].join(" OR ");
 
+/** Both the backfill and the incremental pull are scoped to these senders. */
+function senderFilter(): string {
+  return `from:(${SENDER_FILTER})`;
+}
+
 export function backfillQuery(now = Date.now()): string {
   const after = Math.floor((now - BACKFILL_DAYS * 24 * 60 * 60 * 1000) / 1000);
-  return `after:${after} from:(${SENDER_FILTER})`;
+  return `after:${after} ${senderFilter()}`;
 }
 
 function googleConfig(): { clientId: string; clientSecret: string } {
@@ -200,13 +211,54 @@ function messageText(message: GmailMessage): string {
   return "";
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface GmailErrorBody {
+  error?: { message?: string; errors?: Array<{ reason?: string }> };
+}
+
+/**
+ * A backfill reads hundreds of messages, and Gmail answers a burst with 403
+ * `userRateLimitExceeded` or 429 rather than a permanent failure. Those are
+ * retried with backoff so one throttle does not abandon a 12-month sync.
+ */
 async function gmailGet<T>(accessToken: string, path: string): Promise<T> {
-  const response = await fetch(`${GMAIL}${path}`, {
-    headers: { authorization: `Bearer ${accessToken}` },
-  });
-  if (response.status === 401) throw new Error("Gmail rejected the access token.");
-  if (!response.ok) throw new Error(`Gmail request failed (${response.status}) on ${path}`);
-  return (await response.json()) as T;
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await fetch(`${GMAIL}${path}`, {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    if (response.ok) return (await response.json()) as T;
+
+    const text = await response.text();
+    let detail = text.slice(0, 300);
+    let reason: string | undefined;
+    try {
+      const body = JSON.parse(text) as GmailErrorBody;
+      reason = body.error?.errors?.[0]?.reason;
+      detail = body.error?.message ?? detail;
+    } catch {
+      // Not JSON; the truncated body is the best detail available.
+    }
+
+    const throttled =
+      response.status === 429 ||
+      response.status >= 500 ||
+      reason === "rateLimitExceeded" ||
+      reason === "userRateLimitExceeded";
+    if (throttled && attempt < 4) {
+      const wait = 2000 * 2 ** attempt;
+      console.warn(`[ingest] gmail ${response.status} on ${path.split("?")[0]}, retrying in ${wait}ms`);
+      await sleep(wait);
+      continue;
+    }
+
+    if (response.status === 401) throw new Error("Gmail rejected the access token.");
+    throw new Error(
+      `Gmail request failed (${response.status}) on ${path.split("?")[0]}: ${reason ?? "unknown"} ${detail}`.trim(),
+    );
+  }
 }
 
 interface GmailListResponse {
@@ -356,7 +408,14 @@ export async function syncGmailSource(
       const cursorMs = source.cursor?.internalDateMs ?? Date.now() - 3 * 24 * 60 * 60 * 1000;
       // A minute of overlap plus the alert document id make a re-read harmless.
       const after = Math.max(0, Math.floor(cursorMs / 1000) - 60);
-      const page = await gmailList(tokens.access_token, `after:${after}`, null, maxMessages);
+      // Without the allowlist every personal email that arrives would become a
+      // review item, because an alert with no amount is stored as unparsed.
+      const page = await gmailList(
+        tokens.access_token,
+        `after:${after} ${senderFilter()}`,
+        null,
+        maxMessages,
+      );
       const ids = (page.messages ?? []).map((message) => message.id).reverse();
       const newest = await ingestMessages(tokens.access_token, ids, sourceId, ctx, summary);
 

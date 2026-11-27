@@ -72,8 +72,70 @@ const CARD_BILL =
 const SELF_TRANSFER =
   /\b(self transfer|own account|own a\/c|between your accounts|to your own|transfer to self)\b/i;
 
+/**
+ * "Multi Option Dep (FD) of Rs 3,50,000.00 created on 30/10/26 by Auto Sweep
+ * out of your SB A/c" moves the owner's own money into a deposit: a transfer,
+ * not a spend, but still a movement that must not vanish from the ledger.
+ */
+const FD_SWEEP = /\b(auto\s*sweep|multi\s*option\s*dep(?:osit)?)\b/i;
+
+/**
+ * Bank complaint desks answer with the amount quoted back to the owner ("the
+ * ₹199 EMI processing fee ... transaction of ₹35,780.39"): that is
+ * correspondence about a past row, never a new movement.
+ */
+const CORRESPONDENCE =
+  /\b(?:system-generated\s+(?:response|email|e-mail)|acknowledge\s+receipt\s+of\s+your\s+e-?mail|writing\s+with\s+reference\s+to\s+your\s+(?:concern|query|complaint)|reference\s+to\s+your\s+(?:e-?mail|concern|query|complaint)\s+regarding|escalate\s+your\s+(?:concern|complaint|grievance)|nodal\s+officer|non-resolution\s+of\s+your\s+(?:complaint|concern|grievance))\b/i;
+
+/**
+ * Promotional mail quotes rupee figures ("save up to ₹3,000", "bonus offers of
+ * ₹250") and spend verbs ("every ₹200 spent"), so one keyword proves nothing.
+ * Several markers together are conclusive: a real alert carries none of them.
+ */
+const PROMO_MARKERS: RegExp[] = [
+  /\bunsubscribe\b/i,
+  /to view this message in html/i,
+  /\bt\s*&\s*c\s+apply\b|\bterms\s*(?:&|and)\s*conditions apply\b/i,
+  /\ball brand names and logos\b/i,
+  /\bfor illustration purposes?\b/i,
+  /\b(?:shop|buy|book)\s+now\b/i,
+  /\bfollow us\b/i,
+  /\b(?:deliverylabel|campaignname)\b/i,
+];
+
+/**
+ * A real alert names the instrument that moved: "credit card (5278)", "A/c
+ * XX9711", "card ending 78". Promotional footers put "unsubscribe" and "T&C
+ * apply" under a genuine alert, so the markers alone cannot condemn a message
+ * that names its account.
+ */
+const ACCOUNT_MENTION =
+  /\b(?:a\/c|account|acct)\b|\b(?:credit|debit)?\s*card\b[^.\n]{0,30}\d{2,}|\bending\s+(?:with|in)?\s*\d{2,}|\b(?:x{2,}|\*{2,})\s*\d{2,}/i;
+
+function isPromotional(text: string): boolean {
+  let hits = 0;
+  for (const marker of PROMO_MARKERS) {
+    if (marker.test(text)) hits += 1;
+    if (hits >= 2) return true;
+  }
+  return false;
+}
+
+/** Mail that can never be a transaction, whatever amount it quotes. */
+export function isNonTransactionalNoise(text: string): boolean {
+  return CORRESPONDENCE.test(text) || (isPromotional(text) && !ACCOUNT_MENTION.test(text));
+}
+
+/** A deposit sweep the ledger should record as a transfer. */
+export function isDepositSweep(text: string): boolean {
+  return FD_SWEEP.test(text) && /\b(?:out of|from)\s+your\b/i.test(text);
+}
+
 /** Direction words after removing "credit card", which is not a credit. */
 function detectDirection(text: string): Direction | null {
+  // Money swept out of the savings account into the owner's own deposit.
+  if (isDepositSweep(text)) return "debit";
+
   // "Payment of Rs 15,000 received on your credit card" is money coming back
   // to the owner's card account, not a purchase, even if "payment" reads as a
   // debit word.
@@ -117,23 +179,33 @@ const AMOUNT_PATTERNS: RegExp[] = [
   /\bamount\s*(?:\(\s*(?:inr|₹)\s*\)|(?:inr|₹))?\s*[:#]?\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)(?![0-9])/i,
 ];
 
-function detectAmountPaise(text: string): number | null {
+interface AmountMatch {
+  paise: number;
+  index: number;
+}
+
+function findAmount(text: string): AmountMatch | null {
   for (const pattern of AMOUNT_PATTERNS) {
     const match = text.match(pattern);
     const raw = match?.[1];
-    if (!raw) continue;
+    if (!raw || match?.index === undefined) continue;
     const rupees = Number(raw.replace(/,/g, ""));
     if (!Number.isFinite(rupees) || rupees <= 0) continue;
     const paise = Math.round(rupees * 100);
     // A bank alert above one crore is far more likely a misread reference.
     if (paise > 1_00_00_00_000_00) continue;
-    return paise;
+    return { paise, index: match.index };
   }
   return null;
 }
 
+export function detectAmountPaise(text: string): number | null {
+  return findAmount(text)?.paise ?? null;
+}
+
 const LAST4_PATTERNS: RegExp[] = [
-  /\b(?:ending(?:\s+(?:with|in))?|ending\.?)\s*[:#]?\s*(?:xx|xx\*+|\*+)?\s*(\d{4})\b/i,
+  // Cards print the mask as "XX8812", "x7449" or just "ending 8812".
+  /\bending(?:\s+(?:with|in))?\.?\s*[:#]?\s*(?:x{1,2}|\*+)?\s*(\d{4})\b/i,
   /\b(?:a\/c|account|card|ac)\s*(?:no\.?|number)?\s*[:#]?\s*(?:xx|x{1,4}|\*+)?(\d{4})\b/i,
   /\b(?:xx|\*{2,})(\d{4})\b/i,
 ];
@@ -153,10 +225,27 @@ const MERCHANT_PATTERNS: RegExp[] = [
   /\b(?:terminal owner name|merchant name|payee name|payee|terminal)\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9&.'_\- ]{2,48}?)(?=\s+(?:terminal|date|transaction|amount|last|channel|city|location|if not|you may)\b|[.,;\n]|$)/i,
   // A VPA handle is the most reliable merchant identity when present.
   VPA,
-  /\b(?:at|towards|paid to|sent to|to merchant|merchant)\s+([A-Za-z0-9][A-Za-z0-9&.'_\- ]{1,48}?)(?=\s+(?:on|via|using|from|ref|for|dt\.?|dated|successful|success|has been)\b|[.,;\n]|$)/i,
+  // Bare "merchant" is prose ("merchant credit refund of INR 1330"); only the
+  // labelled form and real prepositional phrases name a payee.
+  /\b(?:at|towards|paid to|sent to|to merchant|merchant name)\s+([A-Za-z0-9][A-Za-z0-9&.'_\- ]{1,48}?)(?=\s+(?:on|via|using|from|ref|for|dt\.?|dated|successful|success|has been)\b|[.,;\n]|$)/i,
   /\bto\s+([A-Za-z0-9][A-Za-z0-9&.'_\- ]{1,40}?)(?=\s+(?:on|via|using|ref|from|for)\b|[.,;\n]|$)/i,
   /\bfrom\s+([A-Za-z0-9][A-Za-z0-9&.'_\- ]{1,40}?)(?=\s+(?:on|via|using|ref|for)\b|[.,;\n]|$)/i,
 ];
+
+/**
+ * Marketing mail is allowed through the sender filter and often carries a rupee
+ * figure ("save up to ₹7,000"), but it never names the account it debited or a
+ * transaction reference, so it must stay out of the ledger.
+ */
+const TRANSACTION_VERB =
+  /\b(?:debited|credited|spent|withdrawn|refund(?:ed)?|reversed|reversal|has\s+(?:a\s+)?(?:debit|credit)|has\s+been\s+(?:debited|credited)|transaction\s+of|payment\s+of)\b/i;
+
+const JUNK_MERCHANT =
+  /html\s*format|click\s*here|unsubscribe|terms\s*(?:and|&)\s*conditions|privacy\s*policy|discretion|warranty|password|kyc|additional\s+cost|toll\s*free|auto\s*generated|do\s+not\s+reply|customer\s*care|contact\s+us|report\s+fraud|available\s+credit|capping|https?:|www\.|@[a-z0-9-]+\./i;
+
+/** A candidate that opens with a function word came from prose, not a payee. */
+const PROSE_START =
+  /^(?:the|their|this|that|these|and|all|some|any|no|not|be|is|are|was|were|will|would|can|could|should|may|might|must|it|its|if|for|to|at|in|on|of|or|as|by|from|with|view|receive|exercise|report|click|please|your|you|we|our|us|contact|download|update|ensure|know|get|see|read|track|manage|activate|apply|verify|pay|make|continue|check|avail|join|explore|discover|shop|buy|order|book|register|subscribe|call|visit|write|send|reply|qualify|location)\b/i;
 
 const MERCHANT_STOP = new Set([
   "rs",
@@ -179,6 +268,10 @@ const MERCHANT_STOP = new Set([
   "transaction",
   "successful",
   "success",
+  "creditcard",
+  "credit card",
+  "debit card",
+  "credit refund",
 ]);
 
 export function cleanMerchant(value: string | null): string | null {
@@ -189,8 +282,12 @@ export function cleanMerchant(value: string | null): string | null {
     .replace(/\b(?:on|via|ref|dt|dated)\b.*$/i, "")
     .trim();
   if (cleaned.length < 3 || cleaned.length > 60) return null;
-  if (/^\d+$/.test(cleaned)) return null;
   if (MERCHANT_STOP.has(cleaned.toLowerCase())) return null;
+  // Digit groups with spaces are phone/toll-free numbers, never payees.
+  if (/^[\d\s()+./-]{3,}$/.test(cleaned)) return null;
+  // A long digit run is a phone number, OTP or account id, not a payee.
+  if (/\d{5,}/.test(cleaned)) return null;
+  if (PROSE_START.test(cleaned) || JUNK_MERCHANT.test(cleaned)) return null;
   return cleaned;
 }
 
@@ -203,11 +300,15 @@ function detectMerchant(text: string): string | null {
   return null;
 }
 
+/**
+ * `ref` needs a boundary of its own: "refreshed every day" and "preferred"
+ * are prose, and a captured fragment there anchors a marketing mail.
+ */
+const REFERENCE =
+  /\b(?:rrn|utr|ref(?:erence)?|txn\s*id|transaction\s*(?:no|number|id))\b\.?\s*(?:(?:no|id|number)\b\.?)?\s*[:#]?\s*([A-Za-z0-9]{6,24})\b/i;
+
 function detectReference(text: string): string | null {
-  const match = text.match(
-    /\b(?:rrn|utr|ref(?:erence)?(?:\s*(?:no\.?|id|number))?|txn\s*id)\s*[:#]?\s*([A-Za-z0-9]{6,24})\b/i,
-  );
-  return match?.[1] ?? null;
+  return text.match(REFERENCE)?.[1] ?? null;
 }
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
@@ -236,7 +337,7 @@ export function detectOccurredAt(text: string, fallback: Date): Date | null {
   }
 
   const named = text.match(
-    /\b(\d{1,2})[\s-](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s,-]+(\d{2,4})(?:[ T,](\d{1,2}):(\d{2}))?/i,
+    /\b(\d{1,2})(?:st|nd|rd|th)?[\s-](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s,-]+(\d{2,4})(?:[ T,](\d{1,2}):(\d{2}))?/i,
   );
   if (named) {
     const [, day, monthName, year, hour, minute] = named;
@@ -276,29 +377,48 @@ export function parseAlert(alert: AlertText): ParsedAlert {
   const text = `${alert.subject ?? ""}\n${alert.body}`.trim();
   const sender = senderTemplate(alert.from);
 
-  const amountPaise = detectAmountPaise(text);
+  const amount = findAmount(text);
+  const amountPaise = amount?.paise ?? null;
+  // Money is described next to its amount. A payee, card number or verb only
+  // counts when it sits in that neighbourhood; footers talk about "offers that
+  // may be withdrawn" and toll-free numbers, and must not fake a transaction.
+  const focus = amount
+    ? text.slice(Math.max(0, amount.index - 260), amount.index + 320)
+    : text;
+
   const direction = detectDirection(text);
   const isCardBill = CARD_BILL.test(text) && Boolean(direction);
-  const isSelfTransfer = SELF_TRANSFER.test(text);
+  const isSelfTransfer = SELF_TRANSFER.test(text) || isDepositSweep(text);
   const paymentMode = detectMode(text, isCardBill);
-  let merchantRaw = detectMerchant(text);
+  let merchantRaw = detectMerchant(focus);
 
   // A card-bill alert is a move between the owner's own accounts: the "merchant"
   // is the card issuer and is misleading in the ledger.
   if (isCardBill) merchantRaw = null;
 
-  const last4 = detectLast4(text);
-  const referenceId = detectReference(text);
+  const last4 = detectLast4(focus);
+  const referenceId = detectReference(focus);
   const occurredAt = detectOccurredAt(text, alert.receivedAt);
 
-  const ignored = amountPaise === null && (OTP.test(text) || PROMO.test(text));
-  const parseStatus: ParseStatus = ignored
+  // A card number alone is not money moving: "Credit Limit: ₹1,12,000 on your
+  // card ending 6419" and "Min. Cumulative Spend: Rs.5,000" both name a card.
+  // Only a reference or a verb that says what happened can anchor a row.
+  const anchor = Boolean(referenceId) || TRANSACTION_VERB.test(focus) || isDepositSweep(text);
+  const transactional = amountPaise !== null && direction !== null && anchor;
+
+  // Money-shaped prose without an account, a reference or a transaction verb is
+  // a promotion, not a payment: it goes to the review queue, never the ledger.
+  const parseStatus: ParseStatus = isNonTransactionalNoise(text)
     ? "ignored"
-    : amountPaise !== null && direction !== null && merchantRaw !== null
-      ? "parsed"
-      : amountPaise !== null
-        ? "parsed_incomplete"
-        : "unparsed";
+    : transactional
+      ? merchantRaw !== null
+        ? "parsed"
+        : "parsed_incomplete"
+      : OTP.test(text) || PROMO.test(text)
+        ? "ignored"
+        : amountPaise !== null && direction === null
+          ? "parsed_incomplete"
+          : "unparsed";
 
   const confidence =
     parseStatus === "parsed"
@@ -307,7 +427,9 @@ export function parseAlert(alert: AlertText): ParsedAlert {
         ? direction !== null
           ? 0.55
           : 0.4
-        : 0.1;
+        : parseStatus === "ignored"
+          ? 0.05
+          : 0.1;
 
   return {
     amountPaise,
