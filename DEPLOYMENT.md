@@ -62,6 +62,25 @@ will see an "unverified app" warning when signing in, which is normal for a
 restricted scope like `gmail.readonly` and safe to click through for your own
 account).
 
+## 2b. Firebase Auth — authorise the Vercel domain
+
+`signInWithPopup` refuses any origin that is not listed in the Firebase project,
+and the failure is a client-side `auth/unauthorized-domain` error before the page
+ever reaches the server. Firebase only trusts `localhost` and
+`<project>.firebaseapp.com` out of the box, so add every domain the app is served
+from:
+
+Firebase Console → **Authentication** → **Settings** → **Authorized domains** →
+*Add domain*:
+
+- `artha-kosha.vercel.app` (production)
+- any Vercel preview alias you actually sign in on, e.g.
+  `artha-kosha-git-main-<team>.vercel.app` (each preview URL is its own domain;
+  there is no wildcard, so add the ones you use)
+
+Do this once per Firebase project, not per deployment, and it takes effect
+immediately — no redeploy needed.
+
 ## 3. Deploy on Vercel
 
 1. Push this repo to GitHub (below), then Vercel → Add New → Project → import it.

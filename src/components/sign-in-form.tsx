@@ -45,7 +45,14 @@ export function SignInForm() {
       router.refresh();
     } catch (error) {
       console.error(error);
-      setState({ kind: "error", message: "Sign-in failed. Check the console and try again." });
+      const code = (error as { code?: string } | null)?.code;
+      const message =
+        code === "auth/unauthorized-domain"
+          ? "This domain is not authorised in Firebase Authentication. Add it under Authentication → Settings → Authorized domains, then reload."
+          : code === "auth/popup-blocked"
+            ? "The sign-in popup was blocked. Allow popups for this site and try again."
+            : "Sign-in failed. Check the console and try again.";
+      setState({ kind: "error", message });
     }
   }
 
