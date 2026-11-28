@@ -58,6 +58,9 @@ export function senderTemplate(from: string | null): { id: string; institution: 
   return hit ? { id: hit.id, institution: hit.institution } : { id: "generic", institution: null };
 }
 
+/** Retailer/marketing senders that never carry a bank-money alert. */
+const PROMO_ONLY_SENDERS = new Set(["samsung"]);
+
 const DEBIT_WORDS =
   /\b(debited|debit|spent|withdrawn|withdrawal|purchase|paid|sent|transferred to|dr)\b/gi;
 const CREDIT_WORDS =
@@ -408,7 +411,7 @@ export function parseAlert(alert: AlertText): ParsedAlert {
 
   // Money-shaped prose without an account, a reference or a transaction verb is
   // a promotion, not a payment: it goes to the review queue, never the ledger.
-  const parseStatus: ParseStatus = isNonTransactionalNoise(text)
+  let parseStatus: ParseStatus = isNonTransactionalNoise(text)
     ? "ignored"
     : transactional
       ? merchantRaw !== null
@@ -419,6 +422,10 @@ export function parseAlert(alert: AlertText): ParsedAlert {
         : amountPaise !== null && direction === null
           ? "parsed_incomplete"
           : "unparsed";
+
+  // Retailer marketing (Samsung) names an "account" and a rupee figure, so it
+  // slips past the promotion filter; it is still never a bank transaction.
+  if (PROMO_ONLY_SENDERS.has(sender.id) && isPromotional(text)) parseStatus = "ignored";
 
   const confidence =
     parseStatus === "parsed"
